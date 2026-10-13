@@ -1,0 +1,38 @@
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+[New Thread 0x7fffef00b6c0 (LWP 674022)]
+[New Thread 0x7fffee80a6c0 (LWP 674023)]
+[New Thread 0x7fffee0096c0 (LWP 674024)]
+[New Thread 0x7fffed8086c0 (LWP 674025)]
+[New Thread 0x7fffed0076c0 (LWP 674026)]
+[New Thread 0x7fffec8066c0 (LWP 674027)]
+[New Thread 0x7fffdffff6c0 (LWP 674028)]
+[New Thread 0x7fffdf7fe6c0 (LWP 674029)]
+[New Thread 0x7fffdeffd6c0 (LWP 674030)]
+[New Thread 0x7fffde7fc6c0 (LWP 674031)]
+[New Thread 0x7fffddffb6c0 (LWP 674032)]
+=== C1 (inner non-shared AB) ===
+[*] stream bytes: ff 10 6d 00 00 42 00 5e 00
+[c1] wire version: 16
+[c1] ReadValue #1 returned EMPTY (expected failure)
+[c1] pending exception: Error: Unable to deserialize cloned data.
+[c1] ReadValue #2 returned NON-EMPTY (id-0 object resurfaced!):
+     IsObject=1 IsWasmMemoryObject-ish? checking via JS...
+[js] typeof wmo = [js] returned: object
+[js] wmo instanceof WebAssembly.Memory => [js] returned: true
+[js] now touching wmo.buffer (expected crash site A)...
+
+Thread 1 "harness" received signal SIGSEGV, Segmentation fault.
+RefreshBuffer () at ../../src/wasm/wasm-objects.cc:1034
+1034	  const SharedFlag bs_shared = backing_store->is_shared();
+#0  RefreshBuffer () at ../../src/wasm/wasm-objects.cc:1034
+#1  0x00007ffff58e7f7e in GetArrayBuffer () at ../../src/wasm/wasm-objects.cc:1211
+#2  0x00007ffff58b53d3 in WebAssemblyMemoryGetBufferImpl () at ../../src/wasm/wasm-js.cc:2678
+#3  WebAssemblyMemoryGetBuffer () at ../../src/wasm/wasm-js.cc:3003
+#4  0x00007ffff2864320 in Builtins_CallApiCallbackGeneric () at <builtin>:1
+#5  0x0000000000000000 in ?? ()
+rip            0x7ffff58e6fb1      0x7ffff58e6fb1 <RefreshBuffer()+177>
+r13            0x0                 0
+=> 0x7ffff58e6fb1 <RefreshBuffer()+177>:	movzwl 0x48(%r13),%eax
+   0x7ffff58e6fb6 <RefreshBuffer()+182>:	test   $0x100,%r12d
+$1 = 0x48

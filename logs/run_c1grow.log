@@ -1,0 +1,10 @@
+=== C1 (inner non-shared AB, grow first) ===
+[*] stream bytes: ff 10 6d 00 00 42 00 5e 00
+[c1] wire version: 16
+[c1] ReadValue #1 returned EMPTY (expected failure)
+[c1] pending exception: Error: Unable to deserialize cloned data.
+[c1] ReadValue #2 returned NON-EMPTY (id-0 object resurfaced!):
+     IsObject=1 IsWasmMemoryObject-ish? checking via JS...
+[js] typeof wmo = [js] returned: object
+[js] wmo instanceof WebAssembly.Memory => [js] returned: true
+[js] now calling wmo.grow(0) (expected crash site B)...

