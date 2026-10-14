@@ -12,6 +12,7 @@ Both findings are in `src/objects/value-serializer.cc`, both are crash-primitive
 |---|-------|-----------|-------|
 | 1 | [Half-initialized WasmMemoryObject escapes ID map](bug-1-halfinit-wasm-memory/README.md) | register-then-fail + ResetIdMap removal | null backstore deref → renderer crash (deterministic SIGSEGV) |
 | 2 | [Missing STACK_CHECK in ReadWasmMemory recursion](bug-2-missing-stack-check/README.md) | ReadWasmMemory calls ReadObjectInternal directly | native stack exhaustion → renderer crash |
+| 3 | [SharedObjectConveyor::GetPersisted DCHECK-only bounds check](bug-3-shared-object-oob/README.md) | `DCHECK(HasPersisted(object_id))` on stream-derived index | latent infoleak / fake-object on non-hardened STLs; DoS/SIGABRT on shipping builds; **currently latent behind `--harmony-struct`** |
 
 ## Layout
 

